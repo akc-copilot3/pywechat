@@ -40,8 +40,9 @@ import time
 import emoji
 import json
 import pyautogui
+import asyncio
 from warnings import warn
-from typing import Literal
+from typing import Literal, Callable, Awaitable
 from concurrent.futures import ThreadPoolExecutor#Pytho3.2以上版本
 from .Warnings import LongTextWarning,ChatHistoryNotEnough
 from .WechatTools import Tools,mouse,Desktop
@@ -5575,25 +5576,47 @@ class AutoReply():
             print(f'未接听到任何微信视频或语音电话')
 
     @staticmethod
-    def auto_reply_messages(content:str,duration:str,dontReplytoGroup:bool=False,max_pages:int=5,never_reply:list=[],scroll_delay:int=0,wechat_path:str=None,is_maximize:bool=True,close_wechat:bool=True)->None:
+    def auto_reply_messages(content=None, reply_func=None, duration:str="", dontReplytoGroup:bool=False, max_pages:int=5, never_reply:list=[], scroll_delay:int=0, wechat_path:str=None, is_maximize:bool=True, close_wechat:bool=True)->None:
         '''
         该方法用来遍历会话列表查找新消息自动回复,最大回复数量=max_pages*(8~10)\n
         如果你不想回复某些好友,你可以临时将其设为消息免打扰,或传入\n
         一个包含不回复好友或群聊的昵称列表never_reply
+        
+        支持两种模式：
+        1. 固定内容模式：传入content参数，使用固定内容回复
+        2. 动态内容模式：传入reply_func异步函数，根据收到的消息动态决定回复内容
+        
         Args:
-            content:自动回复内容
-            duration:自动回复持续时长,格式:'s','min','h'单位:s/秒,min/分,h/小时
-            dontReplytoGroup:不回复群聊(即使有新消息也不回复)
-            max_pages:遍历会话列表页数,一页为8~10人,设定持续时间后,将持续在max_pages内循环遍历查找是否有新消息
-            never_reply:在never_reply列表中的好友即使有新消息时也不会回复
-            scroll_delay:滚动遍历max_pages页会话列表后暂停秒数,如果你的max_pages很大,且持续时间长,scroll_delay还为0的话,那么一直滚动遍历有可能被微信检测到自动退出登录
+            content: 自动回复内容（固定内容模式使用）
+            reply_func: 异步函数，用于动态生成回复内容（动态内容模式使用）
+                       函数签名：async def reply_func(received_message: str, sender: str, chat_type: str) -> str
+                       参数说明：
+                       - received_message: 收到的消息内容
+                       - sender: 发送者名称
+                       - chat_type: 聊天类型（'好友' 或 '群聊'）
+                       返回值：要回复的消息内容，返回None或空字符串则不回复
+            duration: 自动回复持续时长,格式:'s','min','h'单位:s/秒,min/分,h/小时
+            dontReplytoGroup: 不回复群聊(即使有新消息也不回复)
+            max_pages: 遍历会话列表页数,一页为8~10人,设定持续时间后,将持续在max_pages内循环遍历查找是否有新消息
+            never_reply: 在never_reply列表中的好友即使有新消息时也不会回复
+            scroll_delay: 滚动遍历max_pages页会话列表后暂停秒数,如果你的max_pages很大,且持续时间长,scroll_delay还为0的话,那么一直滚动遍历有可能被微信检测到自动退出登录
                 该参数只在会话列表可以滚动的情况下生效
-            wechat_path:微信的WeChat.exe文件地址,主要针对未登录情况而言,一般而言不需要传入该参数,因为pywechat会通过查询环境变量,注册表等一些方法
+            wechat_path: 微信的WeChat.exe文件地址,主要针对未登录情况而言,一般而言不需要传入该参数,因为pywechat会通过查询环境变量,注册表等一些方法
                 尽可能地自动找到微信路径,然后实现无论PC微信是否启动都可以实现自动化操作,除非你的微信路径手动修改过,发生了变动的话可能需要
                 传入该参数。最后,还是建议加入到环境变量里吧,这样方便一些。加入环境变量可调用set_wechat_as_environ_path函数
-            is_maximize:微信界面是否全屏,默认全屏。
-            close_wechat:任务结束后是否关闭微信,默认关闭
+            is_maximize: 微信界面是否全屏,默认全屏。
+            close_wechat: 任务结束后是否关闭微信,默认关闭
         '''
+        # 参数验证
+        if content is None and reply_func is None:
+            raise ValueError("必须提供content或reply_func参数之一")
+        if content is not None and reply_func is not None:
+            raise ValueError("不能同时提供content和reply_func参数，请选择其中一种模式")
+        if reply_func is not None and not asyncio.iscoroutinefunction(reply_func):
+            raise ValueError("reply_func必须是异步函数")
+        if not duration:
+            raise ValueError("duration参数不能为空")
+            
         if language=='简体中文':
             taboo_list=['微信团队','微信支付','微信运动','订阅号','腾讯新闻','服务通知','微信游戏']
         if language=='繁体中文':
@@ -5609,7 +5632,10 @@ class AutoReply():
         if not duration:
             raise TimeNotCorrectError
         Systemsettings.open_listening_mode(full_volume=False)
-        Systemsettings.copy_text_to_windowsclipboard(content)
+        
+        # 如果是固定内容模式，预先复制到剪贴板
+        if content is not None:
+            Systemsettings.copy_text_to_windowsclipboard(content)
         def record():
             #遍历当前会话列表内的所有成员，获取他们的名称，没有新消息的话返回[]
             #newMessagefriends为会话列表(List)中所有含有新消息的ListItem
@@ -5621,7 +5647,7 @@ class AutoReply():
             return []
 
         #监听并且回复右侧聊天界面
-        def listen_on_current_chat():
+        async def listen_on_current_chat():
             voice_call_button=main_window.child_window(**Buttons.VoiceCallButton)
             video_call_button=main_window.child_window(**Buttons.VideoCallButton)
             current_chat=main_window.child_window(**Main_window.CurrentChatWindow)
@@ -5636,28 +5662,66 @@ class AutoReply():
             if type=='好友' and current_chat.window_text() not in taboo_list:
                 latest_message,who=Tools.pull_latest_message(chatlist)#最新的消息
                 if who==current_chat.window_text() and latest_message!=initial_last_message:#不等于刚打开页面时的那条消息且发送者是对方
-                    current_chat.click_input()
-                    pyautogui.hotkey('ctrl','v',_pause=False)
-                    pyautogui.hotkey('alt','s',_pause=False)
-                    responsed_friend.add(current_chat.window_text())
-                    if scorllable:
-                        mouse.click(coords=(x+2,y-6))#点击右上方激活滑块
-            if type=='群聊' and current_chat.window_text() not in taboo_list:
-                latest_message,who=Tools.pull_latest_message(chatlist)#最新的消息
-                if latest_message!=initial_last_message and who!=myname:
-                    if not dontReplytoGroup:
+                    # 获取消息内容
+                    received_message = latest_message.window_text() if hasattr(latest_message, 'window_text') else str(latest_message)
+                    
+                    if reply_func is not None:
+                        # 动态内容模式
+                        try:
+                            reply_content = await reply_func(received_message, current_chat.window_text(), type)
+                            if reply_content and reply_content.strip():
+                                Systemsettings.copy_text_to_windowsclipboard(reply_content)
+                                current_chat.click_input()
+                                pyautogui.hotkey('ctrl','v',_pause=False)
+                                pyautogui.hotkey('alt','s',_pause=False)
+                                responsed_friend.add(current_chat.window_text())
+                        except Exception as e:
+                            print(f"动态回复函数执行错误: {e}")
+                    else:
+                        # 固定内容模式
                         current_chat.click_input()
                         pyautogui.hotkey('ctrl','v',_pause=False)
                         pyautogui.hotkey('alt','s',_pause=False)
                         responsed_friend.add(current_chat.window_text())
-                        responsed_groups.add(current_chat.window_text())
+                    
+                    if scorllable:
+                        mouse.click(coords=(x+2,y-6))#点击右上方激活滑块
+                        
+            if type=='群聊' and current_chat.window_text() not in taboo_list:
+                latest_message,who=Tools.pull_latest_message(chatlist)#最新的消息
+                if latest_message!=initial_last_message and who!=myname:
+                    if not dontReplytoGroup:
+                        # 获取消息内容
+                        received_message = latest_message.window_text() if hasattr(latest_message, 'window_text') else str(latest_message)
+                        
+                        if reply_func is not None:
+                            # 动态内容模式
+                            try:
+                                reply_content = await reply_func(received_message, current_chat.window_text(), type)
+                                if reply_content and reply_content.strip():
+                                    Systemsettings.copy_text_to_windowsclipboard(reply_content)
+                                    current_chat.click_input()
+                                    pyautogui.hotkey('ctrl','v',_pause=False)
+                                    pyautogui.hotkey('alt','s',_pause=False)
+                                    responsed_friend.add(current_chat.window_text())
+                                    responsed_groups.add(current_chat.window_text())
+                            except Exception as e:
+                                print(f"动态回复函数执行错误: {e}")
+                        else:
+                            # 固定内容模式
+                            current_chat.click_input()
+                            pyautogui.hotkey('ctrl','v',_pause=False)
+                            pyautogui.hotkey('alt','s',_pause=False)
+                            responsed_friend.add(current_chat.window_text())
+                            responsed_groups.add(current_chat.window_text())
+                        
                         if scorllable:
                             mouse.click(coords=(x+2,y-6))#点击右上方激活滑块
                     if dontReplytoGroup:
                         unresponsed_group.add(current_chat.window_text())
 
         #用来回复在会话列表中找到的头顶有红色数字新消息提示的好友
-        def reply(names):
+        async def reply(names):
             names=[name for name in names if name not in taboo_list]#tabool_list是传入的never_reply和我这里定义的的一些不回复对象,比如'微信运动','微信支付'灯
             if names:
                 for name in names:       
@@ -5673,17 +5737,54 @@ class AutoReply():
                         type='非好友'
                     if type=='好友':#有语音聊天按钮不是公众号,不用关注
                         current_chat=main_window.child_window(**Main_window.CurrentChatWindow)
-                        current_chat.click_input()
-                        pyautogui.hotkey('ctrl','v',_pause=False)
-                        pyautogui.hotkey('alt','s',_pause=False)
-                        responsed_friend.add(name) 
+                        
+                        # 获取最新消息内容用于动态回复
+                        if reply_func is not None:
+                            try:
+                                latest_message, who = Tools.pull_latest_message(chatlist)
+                                received_message = latest_message.window_text() if hasattr(latest_message, 'window_text') else str(latest_message)
+                                reply_content = await reply_func(received_message, name, type)
+                                if reply_content and reply_content.strip():
+                                    Systemsettings.copy_text_to_windowsclipboard(reply_content)
+                                    current_chat.click_input()
+                                    pyautogui.hotkey('ctrl','v',_pause=False)
+                                    pyautogui.hotkey('alt','s',_pause=False)
+                                    responsed_friend.add(name)
+                            except Exception as e:
+                                print(f"动态回复函数执行错误: {e}")
+                        else:
+                            # 固定内容模式
+                            current_chat.click_input()
+                            pyautogui.hotkey('ctrl','v',_pause=False)
+                            pyautogui.hotkey('alt','s',_pause=False)
+                            responsed_friend.add(name)
+                            
                     if type=='群聊' and not dontReplytoGroup:
-                            current_chat=main_window.child_window(**Main_window.CurrentChatWindow)
+                        current_chat=main_window.child_window(**Main_window.CurrentChatWindow)
+                        
+                        # 获取最新消息内容用于动态回复
+                        if reply_func is not None:
+                            try:
+                                latest_message, who = Tools.pull_latest_message(chatlist)
+                                received_message = latest_message.window_text() if hasattr(latest_message, 'window_text') else str(latest_message)
+                                reply_content = await reply_func(received_message, name, type)
+                                if reply_content and reply_content.strip():
+                                    Systemsettings.copy_text_to_windowsclipboard(reply_content)
+                                    current_chat.click_input()
+                                    pyautogui.hotkey('ctrl','v',_pause=False)
+                                    pyautogui.hotkey('alt','s',_pause=False)
+                                    responsed_friend.add(name)
+                                    responsed_groups.add(name)
+                            except Exception as e:
+                                print(f"动态回复函数执行错误: {e}")
+                        else:
+                            # 固定内容模式
                             current_chat.click_input()
                             pyautogui.hotkey('ctrl','v',_pause=False)
                             pyautogui.hotkey('alt','s',_pause=False)
                             responsed_friend.add(name)
                             responsed_groups.add(name)
+                            
                     if type=='群聊' and dontReplytoGroup:
                         unresponsed_group.add(name)
                 if scorllable:
@@ -5704,22 +5805,29 @@ class AutoReply():
         search_pages=1
         end_timestamp=time.time()+duration#根据秒数计算截止时间
         chatsButton=main_window.child_window(**SideBar.Chats)
-        while time.time()<end_timestamp:
-            if chatsButton.legacy_properties().get('Value'):#如果左侧的聊天按钮式红色的就遍历,否则原地等待
-                if scorllable:
-                    for _ in range(max_pages+1):
+        # 创建事件循环来处理异步函数
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            while time.time()<end_timestamp:
+                if chatsButton.legacy_properties().get('Value'):#如果左侧的聊天按钮式红色的就遍历,否则原地等待
+                    if scorllable:
+                        for _ in range(max_pages+1):
+                            names=record()
+                            loop.run_until_complete(reply(names))
+                            names.clear()
+                            pyautogui.press('pagedown',_pause=False)
+                            search_pages+=1
+                        pyautogui.press('Home')
+                        time.sleep(scroll_delay)
+                    else:
                         names=record()
-                        reply(names)
+                        loop.run_until_complete(reply(names))
                         names.clear()
-                        pyautogui.press('pagedown',_pause=False)
-                        search_pages+=1
-                    pyautogui.press('Home')
-                    time.sleep(scroll_delay)
-                else:
-                    names=record()
-                    reply(names)
-                    names.clear()
-            listen_on_current_chat()
+                loop.run_until_complete(listen_on_current_chat())
+        finally:
+            loop.close()
         Systemsettings.close_listening_mode()
         if responsed_friend:
             print(f"在{unchanged_duration}内回复了以下好友\n{responsed_friend}")
